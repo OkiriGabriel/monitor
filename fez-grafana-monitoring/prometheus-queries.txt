@@ -1,0 +1,101 @@
+Blackbox Exporter Prometheus Queries
+=====================================
+
+Blackbox exporter doesn't expose a _count metric. Use these queries to count requests:
+
+Count TOTAL requests per URL (success + failure) - last hour:
+count_over_time(probe_success{job="blackbox"}[1h])
+
+Count SUCCESSFUL requests per URL - last hour:
+sum_over_time(probe_success{job="blackbox"}[1h])
+
+Count FAILED requests per URL - last hour:
+count_over_time(probe_success{job="blackbox"}[1h]) - sum_over_time(probe_success{job="blackbox"}[1h])
+
+Count total requests across all URLs:
+sum(count_over_time(probe_success{job="blackbox"}[1h]))
+
+Count requests per URL (last 24 hours):
+count_over_time(probe_success{job="blackbox"}[24h])
+
+Request rate (requests per minute):
+count_over_time(probe_success{job="blackbox"}[1m])
+
+List all available blackbox metrics:
+{job="blackbox"}
+
+=====================================
+View ALL Endpoints Separately (Use this in Grafana Table/Graph)
+=====================================
+
+# Shows each endpoint with its total request count (success + failure):
+count_over_time(probe_success{job="blackbox"}[1h])
+
+# Shows each endpoint with successful request count:
+sum_over_time(probe_success{job="blackbox"}[1h])
+
+# Shows each endpoint with failed request count:
+count_over_time(probe_success{job="blackbox"}[1h]) - sum_over_time(probe_success{job="blackbox"}[1h])
+
+# Success rate percentage per endpoint:
+(sum_over_time(probe_success{job="blackbox"}[1h]) / count_over_time(probe_success{job="blackbox"}[1h])) * 100
+
+=====================================
+Filtered Queries by URL Path (Exact Match)
+=====================================
+
+Base API:
+count_over_time(probe_success{job="blackbox",instance="https://rider-api.fezdelivery.co"}[1h])
+
+Rider Authentication Endpoints:
+count_over_time(probe_success{job="blackbox",instance="https://rider-api.fezdelivery.co/rider/login"}[1h])
+count_over_time(probe_success{job="blackbox",instance="https://rider-api.fezdelivery.co/rider/forgot-password"}[1h])
+count_over_time(probe_success{job="blackbox",instance="https://rider-api.fezdelivery.co/rider/verify-forgot-password"}[1h])
+count_over_time(probe_success{job="blackbox",instance="https://rider-api.fezdelivery.co/rider/change-password"}[1h])
+
+Rider Profile Endpoints:
+count_over_time(probe_success{job="blackbox",instance="https://rider-api.fezdelivery.co/riders/profile"}[1h])
+count_over_time(probe_success{job="blackbox",instance="https://rider-api.fezdelivery.co/riders/fcm-token"}[1h])
+count_over_time(probe_success{job="blackbox",instance="https://rider-api.fezdelivery.co/riders/1"}[1h])
+count_over_time(probe_success{job="blackbox",instance="https://rider-api.fezdelivery.co/riders/location"}[1h])
+count_over_time(probe_success{job="blackbox",instance="https://rider-api.fezdelivery.co/riders/1/stats"}[1h])
+
+Order Endpoints:
+count_over_time(probe_success{job="blackbox",instance="https://rider-api.fezdelivery.co/orders/returned"}[1h])
+count_over_time(probe_success{job="blackbox",instance="https://rider-api.fezdelivery.co/orders/return-to-last-mile"}[1h])
+count_over_time(probe_success{job="blackbox",instance="https://rider-api.fezdelivery.co/orders/delivered"}[1h])
+count_over_time(probe_success{job="blackbox",instance="https://rider-api.fezdelivery.co/orders/picked-up"}[1h])
+count_over_time(probe_success{job="blackbox",instance="https://rider-api.fezdelivery.co/orders/send-delivery-otp"}[1h])
+count_over_time(probe_success{job="blackbox",instance="https://rider-api.fezdelivery.co/orders/verify-delivery-otp"}[1h])
+count_over_time(probe_success{job="blackbox",instance="https://rider-api.fezdelivery.co/orders/send-arrival-sms"}[1h])
+count_over_time(probe_success{job="blackbox",instance="https://rider-api.fezdelivery.co/orders/return-reasons"}[1h])
+count_over_time(probe_success{job="blackbox",instance="https://rider-api.fezdelivery.co/orders/return-to-customer"}[1h])
+count_over_time(probe_success{job="blackbox",instance="https://rider-api.fezdelivery.co/orders/dispatched"}[1h])
+count_over_time(probe_success{job="blackbox",instance="https://rider-api.fezdelivery.co/orders/completed"}[1h])
+count_over_time(probe_success{job="blackbox",instance="https://rider-api.fezdelivery.co/orders/pending"}[1h])
+count_over_time(probe_success{job="blackbox",instance="https://rider-api.fezdelivery.co/orders/last-mile-returned-orders"}[1h])
+count_over_time(probe_success{job="blackbox",instance="https://rider-api.fezdelivery.co/orders/first-mile-returned-orders"}[1h])
+count_over_time(probe_success{job="blackbox",instance="https://rider-api.fezdelivery.co/orders/return-log"}[1h])
+count_over_time(probe_success{job="blackbox",instance="https://rider-api.fezdelivery.co/orders/failed-pick-up"}[1h])
+
+COD Payment Endpoints:
+count_over_time(probe_success{job="blackbox",instance="https://rider-api.fezdelivery.co/codPayments"}[1h])
+count_over_time(probe_success{job="blackbox",instance="https://rider-api.fezdelivery.co/codPayments/verify"}[1h])
+count_over_time(probe_success{job="blackbox",instance="https://rider-api.fezdelivery.co/codPayments/send-url"}[1h])
+
+=====================================
+Grouped by Endpoint Category (Aggregated)
+=====================================
+
+# All Rider Authentication endpoints - Total:
+sum(count_over_time(probe_success{job="blackbox",instance=~"https://rider-api\\.fezdelivery\\.co/rider/(login|forgot-password|verify-forgot-password|change-password)"}[1h]))
+
+# All Rider Profile endpoints - Total:
+sum(count_over_time(probe_success{job="blackbox",instance=~"https://rider-api\\.fezdelivery\\.co/riders/(profile|fcm-token|location|1|1/stats)"}[1h]))
+
+# All Order endpoints - Total:
+sum(count_over_time(probe_success{job="blackbox",instance=~"https://rider-api\\.fezdelivery\\.co/orders/.*"}[1h]))
+
+# All COD Payment endpoints - Total:
+sum(count_over_time(probe_success{job="blackbox",instance=~"https://rider-api\\.fezdelivery\\.co/codPayments.*"}[1h]))
+
