@@ -1,0 +1,23 @@
+Blackbox Exporter Prometheus Queries
+=====================================
+
+Blackbox exporter doesn't expose a _count metric. Use these queries to count requests:
+
+Count total probes/requests per URL (last hour):
+count_over_time(probe_success{job="blackbox"}[1h])
+
+Count successful requests per URL:
+sum_over_time(probe_success{job="blackbox"}[1h])
+
+Count total requests across all URLs:
+sum(count_over_time(probe_success{job="blackbox"}[1h]))
+
+Count requests per URL (last 24 hours):
+count_over_time(probe_success{job="blackbox"}[24h])
+
+Request rate (requests per minute):
+count_over_time(probe_success{job="blackbox"}[1m])
+
+List all available blackbox metrics:
+{job="blackbox"}
+

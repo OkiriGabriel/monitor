@@ -1,0 +1,170 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation Stack - Auto-discovers Windows EC2 with SSM and adds user to Administrators'
+
+Parameters:
+  UserName:
+    Type: String
+    Default: svcTenableScan
+    Description: Username to create on Windows instances
+
+Resources:
+  # SSM Document to create Windows user
+  CreateWindowsUserDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Command
+      DocumentFormat: YAML
+      TargetType: /AWS::EC2::Instance
+      Content:
+        schemaVersion: '2.2'
+        description: Auto-create Windows user on SSM-enabled instances
+        parameters:
+          username:
+            type: String
+            description: Username to create or add to Administrators
+            default: svcTenableScan
+        mainSteps:
+          - action: aws:runPowerShellScript
+            name: createWindowsUser
+            inputs:
+              runCommand:
+                - |
+                  $username = "{{username}}"
+                  
+                  try {
+                      # Check if machine is domain-joined
+                      $isDomainJoined = (Get-WmiObject -Class Win32_ComputerSystem).PartOfDomain
+                      $adminGroup = Get-LocalGroup -SID "S-1-5-32-544"
+                      
+                      if ($isDomainJoined) {
+                          Write-Output "Machine is domain-joined. Checking for domain user: $username"
+                          
+                          # Check if domain user exists (try to resolve)
+                          try {
+                              $domainUser = [System.Security.Principal.NTAccount]::new($username)
+                              $domainUserSid = $domainUser.Translate([System.Security.Principal.SecurityIdentifier])
+                              Write-Output "Domain user $username found (SID: $domainUserSid)"
+                              
+                              # Check if already in Administrators
+                              $isMember = Get-LocalGroupMember -Group $adminGroup -ErrorAction SilentlyContinue | Where-Object { $_.SID -eq $domainUserSid.Value }
+                              
+                              if ($isMember) {
+                                  Write-Output "SKIP: Domain user $username already in Administrators group on $env:COMPUTERNAME"
+                                  exit 0
+                              } else {
+                                  # Add domain user to local Administrators
+                                  Add-LocalGroupMember -Group $adminGroup -Member $username
+                                  
+                                  # Verify addition
+                                  $verifyMember = Get-LocalGroupMember -Group $adminGroup -ErrorAction SilentlyContinue | Where-Object { $_.SID -eq $domainUserSid.Value }
+                                  if ($verifyMember) {
+                                      Write-Output "VERIFIED: Domain user $username is now in Administrators group on $env:COMPUTERNAME"
+                                      Write-Output "User details: $($verifyMember | Format-List | Out-String)"
+                                  } else {
+                                      Write-Output "WARNING: Added user but verification failed. Please check manually."
+                                  }
+                                  exit 0
+                              }
+                          }
+                          catch {
+                              Write-Output "WARNING: Could not resolve domain user $username. Error: $_"
+                              Write-Output "Attempting to add to Administrators anyway..."
+                              try {
+                                  Add-LocalGroupMember -Group $adminGroup -Member $username -ErrorAction Stop
+                                  
+                                  # Verify addition
+                                  $verifyMember = Get-LocalGroupMember -Group $adminGroup -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "*$username" }
+                                  if ($verifyMember) {
+                                      Write-Output "VERIFIED: $username is now in Administrators group on $env:COMPUTERNAME"
+                                      Write-Output "User details: $($verifyMember | Format-List | Out-String)"
+                                  } else {
+                                      Write-Output "WARNING: Added user but verification failed. Please check manually."
+                                  }
+                                  exit 0
+                              }
+                              catch {
+                                  Write-Output "ERROR: Failed to add domain user to Administrators: $_"
+                                  exit 1
+                              }
+                          }
+                      }
+                      
+                      # Not domain-joined - handle as local user
+                      Write-Output "Machine is not domain-joined. Handling as local user: $username"
+                      
+                      # Check if local user exists
+                      $localUserExists = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
+                      
+                      if ($localUserExists) {
+                          # Check if user is in Administrators group
+                          $isMember = Get-LocalGroupMember -Group $adminGroup -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "*$username" }
+                          
+                          if ($isMember) {
+                              Write-Output "SKIP: Local user $username already exists and is in Administrators group on $env:COMPUTERNAME"
+                              Write-Output "No changes needed."
+                              exit 0
+                          } else {
+                              Write-Output "Local user $username exists but not in Administrators. Adding to group..."
+                              Add-LocalGroupMember -Group $adminGroup -Member $username
+                              
+                              # Verify addition
+                              $verifyMember = Get-LocalGroupMember -Group $adminGroup -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "*$username" }
+                              if ($verifyMember) {
+                                  Write-Output "VERIFIED: Local user $username is now in Administrators group on $env:COMPUTERNAME"
+                                  Write-Output "User details: $($verifyMember | Format-List | Out-String)"
+                              } else {
+                                  Write-Output "WARNING: Added user but verification failed. Please check manually."
+                              }
+                              exit 0
+                          }
+                      }
+                      
+                      # User doesn't exist - skip creation for non-domain machines
+                      # For non-domain machines, local users must be created manually with passwords
+                      Write-Output "WARNING: Local user $username does not exist on non-domain machine."
+                      Write-Output "For non-domain machines, users must be created manually. Skipping user creation."
+                      Write-Output "If this is a domain-joined machine, ensure the domain user exists."
+                      exit 0
+                  }
+                  catch {
+                      Write-Output "ERROR: $_"
+                      exit 1
+                  }
+
+  # State Manager Association - Auto-targets all instances, SSM filters for Windows at runtime
+  AutoWindowsUserAssociation:
+    Type: AWS::SSM::Association
+    Properties:
+      Name: !Ref CreateWindowsUserDocument
+      AssociationName: !Sub 'Auto-${UserName}-Association'
+      Parameters:
+        username:
+          - !Ref UserName
+      # Target all instances - SSM automatically filters for Windows at runtime
+      Targets:
+        - Key: InstanceIds
+          Values:
+            - "*"
+      ScheduleExpression: "rate(1 day)"
+      ComplianceSeverity: MEDIUM
+      MaxErrors: "100%"
+      MaxConcurrency: "50%"
+      ApplyOnlyAtCronInterval: false
+
+
+Outputs:
+  DocumentName:
+    Description: SSM Document Name
+    Value: !Ref CreateWindowsUserDocument
+  
+  AssociationId:
+    Description: Association ID
+    Value: !Ref AutoWindowsUserAssociation
+  
+ 
+
+    # Check if user is in Administrators group
+   Get-LocalGroupMember -Group Administrators | Where-Object { $_.Name -like "*svcTenableScan*" } | Format-List
+   
+   # Or see all Administrators
+   Get-LocalGroupMember -Group Administrators | Format-Table Name, PrincipalSource, SID

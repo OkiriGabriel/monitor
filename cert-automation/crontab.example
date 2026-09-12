@@ -1,0 +1,20 @@
+# Certbot Certificate Renewal Cron Job
+#
+# To install this cron job:
+# 1. Edit the path below to match your actual project path
+# 2. Run: sudo crontab -e
+# 3. Copy the line below (without the # comment) into your crontab
+# 4. Save and exit
+#
+# This will check for certificate renewal twice daily at 2 AM and 2 PM
+# Certbot only renews certificates that are within 30 days of expiration,
+# so running this frequently is safe.
+
+# Replace /path/to/monitoring with your actual path
+0 2,14 * * * /path/to/monitoring/cert-automation/certbot-renew.sh >> /path/to/monitoring/cert-automation/logs/certbot-cron.log 2>&1
+
+# Alternative: Daily check at 2 AM
+# 0 2 * * * /path/to/monitoring/cert-automation/certbot-renew.sh >> /path/to/monitoring/cert-automation/logs/certbot-cron.log 2>&1
+
+# Alternative: Weekly check on Sunday at 2 AM
+# 0 2 * * 0 /path/to/monitoring/cert-automation/certbot-renew.sh >> /path/to/monitoring/cert-automation/logs/certbot-cron.log 2>&1

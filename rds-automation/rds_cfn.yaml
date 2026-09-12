@@ -1,0 +1,606 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Auto-reboot RDS MySQL instances when connections or sessions exceed threshold'
+
+Parameters:
+  PrimaryDBInstanceIdentifier:
+    Type: String
+    Default: primary-database
+    Description: Primary RDS DB instance identifier to monitor
+  
+  ReplicaDBInstanceIdentifier:
+    Type: String
+    Default: db-read-replica
+    Description: Read Replica RDS DB instance identifier to monitor
+  
+  ConnectionThreshold:
+    Type: Number
+    Default: 70
+    Description: Number of connections that trigger a reboot
+    MinValue: 1
+  
+  ConnectionReloadThreshold:
+    Type: Number
+    Default: 50
+    Description: Number of connections that trigger a proactive reload/reboot (should be lower than ConnectionThreshold)
+    MinValue: 1
+  
+  SessionThreshold:
+    Type: Number
+    Default: 70
+    Description: Number of active sessions that trigger a reboot
+    MinValue: 1
+  
+  SessionReloadThreshold:
+    Type: Number
+    Default: 10
+    Description: Number of active sessions that trigger a proactive reload/reboot (should be lower than SessionThreshold)
+    MinValue: 1
+  
+  CooldownMinutes:
+    Type: Number
+    Default: 30
+    Description: Minimum minutes between reboots to prevent loops
+    MinValue: 10
+  
+  MonitoringFrequency:
+    Type: Number
+    Default: 5
+    Description: How often to check metrics (in minutes)
+    AllowedValues: [1, 3, 5, 10, 15, 30]
+  
+  EnableSessionMonitoring:
+    Type: String
+    Default: 'false'
+    Description: Enable direct MySQL session monitoring (requires DB credentials in Secrets Manager)
+    AllowedValues: ['true', 'false']
+  
+  DBSecretArn:
+    Type: String
+    Default: ''
+    Description: (Optional) ARN of Secrets Manager secret containing DB credentials for session monitoring
+
+Conditions:
+  EnableSessionMonitoringCondition: !Equals [!Ref EnableSessionMonitoring, 'true']
+
+Resources:
+  # DynamoDB table to track reboot timestamps for cooldown
+  RebootTrackingTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: RDSRebootTracking
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: instance_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: instance_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        Enabled: true
+        AttributeName: ttl
+
+  # IAM Role for Lambda
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: RDSAutoRebootLambdaRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: RDSRebootPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - rds:DescribeDBInstances
+                  - rds:RebootDBInstance
+                Resource: 
+                  - !Sub 'arn:aws:rds:${AWS::Region}:${AWS::AccountId}:db:${PrimaryDBInstanceIdentifier}'
+                  - !Sub 'arn:aws:rds:${AWS::Region}:${AWS::AccountId}:db:${ReplicaDBInstanceIdentifier}'
+              - Effect: Allow
+                Action:
+                  - cloudwatch:GetMetricStatistics
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt RebootTrackingTable.Arn
+              - !If
+                - EnableSessionMonitoringCondition
+                - Effect: Allow
+                  Action:
+                    - secretsmanager:GetSecretValue
+                  Resource: !Ref DBSecretArn
+                - !Ref AWS::NoValue
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:CreateNetworkInterface
+                  - ec2:DeleteNetworkInterface
+                Resource: '*'
+
+  # Lambda Function
+  RDSAutoRebootFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: RDSAutoReboot
+      Description: 'RDS Auto-Reboot with proactive reload thresholds - v2.1 - Updated 2025-12-16'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 90
+      MemorySize: 256
+      Environment:
+        Variables:
+          PRIMARY_DB_IDENTIFIER: !Ref PrimaryDBInstanceIdentifier
+          REPLICA_DB_IDENTIFIER: !Ref ReplicaDBInstanceIdentifier
+          CONNECTION_THRESHOLD: !Ref ConnectionThreshold
+          CONNECTION_RELOAD_THRESHOLD: !Ref ConnectionReloadThreshold
+          SESSION_THRESHOLD: !Ref SessionThreshold
+          SESSION_RELOAD_THRESHOLD: !Ref SessionReloadThreshold
+          COOLDOWN_MINUTES: !Ref CooldownMinutes
+          DB_SECRET_ARN: !If [EnableSessionMonitoringCondition, !Ref DBSecretArn, '']
+          REBOOT_TRACKING_TABLE: !Ref RebootTrackingTable
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          from datetime import datetime, timedelta
+          from decimal import Decimal
+
+          # Initialize AWS clients
+          rds = boto3.client('rds')
+          cloudwatch = boto3.client('cloudwatch')
+          secretsmanager = boto3.client('secretsmanager')
+          dynamodb = boto3.resource('dynamodb')
+
+          # Configuration
+          PRIMARY_DB_IDENTIFIER = os.environ.get('PRIMARY_DB_IDENTIFIER', 'primary-database')
+          REPLICA_DB_IDENTIFIER = os.environ.get('REPLICA_DB_IDENTIFIER', 'db-read-replica')
+          CONNECTION_THRESHOLD = int(os.environ.get('CONNECTION_THRESHOLD', '70'))
+          CONNECTION_RELOAD_THRESHOLD = int(os.environ.get('CONNECTION_RELOAD_THRESHOLD', '50'))
+          SESSION_THRESHOLD = int(os.environ.get('SESSION_THRESHOLD', '70'))
+          SESSION_RELOAD_THRESHOLD = int(os.environ.get('SESSION_RELOAD_THRESHOLD', '10'))
+          COOLDOWN_MINUTES = int(os.environ.get('COOLDOWN_MINUTES', '30'))
+          DB_SECRET_ARN = os.environ.get('DB_SECRET_ARN', '')
+          REBOOT_TRACKING_TABLE = os.environ.get('REBOOT_TRACKING_TABLE', 'RDSRebootTracking')
+
+          # DynamoDB table
+          tracking_table = dynamodb.Table(REBOOT_TRACKING_TABLE)
+
+          def lambda_handler(event, context):
+              print("=== RDS Auto-Reboot Lambda v2.1 - With Reload Thresholds & Cooldown Tracking ===")
+              print(f"Connection reload threshold: {CONNECTION_RELOAD_THRESHOLD}, Critical: {CONNECTION_THRESHOLD}")
+              print(f"Session reload threshold: {SESSION_RELOAD_THRESHOLD}, Critical: {SESSION_THRESHOLD}")
+              print(f"Cooldown period: {COOLDOWN_MINUTES} minutes")
+              results = []
+              
+              # Monitor both primary and replica
+              db_instances = [
+                  {'name': 'PRIMARY', 'identifier': PRIMARY_DB_IDENTIFIER},
+                  {'name': 'REPLICA', 'identifier': REPLICA_DB_IDENTIFIER}
+              ]
+              
+              for db in db_instances:
+                  try:
+                      result = check_and_reboot_if_needed(db['identifier'], db['name'])
+                      results.append(result)
+                  except Exception as e:
+                      print(f"Error processing {db['name']} ({db['identifier']}): {str(e)}")
+                      import traceback
+                      traceback.print_exc()
+                      results.append({
+                          'instance': db['identifier'],
+                          'type': db['name'],
+                          'status': 'error',
+                          'error': str(e)
+                      })
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'message': 'Monitoring check completed',
+                      'results': results
+                  }, default=str)
+              }
+
+          def check_and_reboot_if_needed(db_identifier, db_type):
+              """Check metrics and reboot if thresholds exceeded"""
+              print(f"\n{'='*60}")
+              print(f"Checking {db_type}: {db_identifier}")
+              print(f"{'='*60}")
+              
+              # Get current database connections from CloudWatch
+              current_connections = get_current_connections(db_identifier)
+              print(f"Current connections: {current_connections}")
+              
+              # Get current active sessions from MySQL (if credentials available)
+              current_sessions = None
+              if DB_SECRET_ARN:
+                  try:
+                      import pymysql
+                      current_sessions = get_active_sessions(db_identifier)
+                      print(f"Current active sessions: {current_sessions}")
+                      print(f"Session reload threshold: {SESSION_RELOAD_THRESHOLD}, Critical threshold: {SESSION_THRESHOLD}")
+                  except ImportError:
+                      print("⚠ pymysql not available, skipping session monitoring")
+                  except Exception as e:
+                      print(f"⚠ Error getting sessions: {str(e)}")
+              else:
+                  print("⚠ DB_SECRET_ARN not configured - session monitoring is disabled")
+              
+              # Determine if reboot is needed
+              reboot_needed = False
+              reboot_reason = []
+              
+              # Check connection thresholds
+              if current_connections is not None:
+                  print(f"Connection check: {current_connections} vs reload={CONNECTION_RELOAD_THRESHOLD}, critical={CONNECTION_THRESHOLD}")
+                  if current_connections >= CONNECTION_THRESHOLD:
+                      reboot_needed = True
+                      reboot_reason.append(f"Connections ({current_connections}) >= CRITICAL threshold ({CONNECTION_THRESHOLD})")
+                  elif current_connections >= CONNECTION_RELOAD_THRESHOLD:
+                      reboot_needed = True
+                      reboot_reason.append(f"Connections ({current_connections}) >= reload threshold ({CONNECTION_RELOAD_THRESHOLD})")
+              
+              # Check session thresholds
+              if current_sessions is not None:
+                  print(f"Session check: {current_sessions} vs reload={SESSION_RELOAD_THRESHOLD}, critical={SESSION_THRESHOLD}")
+                  if current_sessions >= SESSION_THRESHOLD:
+                      reboot_needed = True
+                      reboot_reason.append(f"Sessions ({current_sessions}) >= CRITICAL threshold ({SESSION_THRESHOLD})")
+                  elif current_sessions >= SESSION_RELOAD_THRESHOLD:
+                      reboot_needed = True
+                      reboot_reason.append(f"Sessions ({current_sessions}) >= reload threshold ({SESSION_RELOAD_THRESHOLD})")
+              
+              if not reboot_needed:
+                  print(f"✓ No action needed for {db_identifier}")
+                  return {
+                      'instance': db_identifier,
+                      'type': db_type,
+                      'status': 'ok',
+                      'connections': current_connections,
+                      'connection_threshold': CONNECTION_THRESHOLD,
+                      'connection_reload_threshold': CONNECTION_RELOAD_THRESHOLD,
+                      'sessions': current_sessions,
+                      'session_threshold': SESSION_THRESHOLD,
+                      'session_reload_threshold': SESSION_RELOAD_THRESHOLD,
+                      'action': 'none'
+                  }
+              
+              # Reboot is needed
+              print(f"⚠ Reboot needed for {db_identifier}:")
+              for reason in reboot_reason:
+                  print(f"  - {reason}")
+              
+              # Check if instance was recently rebooted (cooldown period)
+              if is_in_cooldown_period(db_identifier):
+                  minutes_since = get_minutes_since_last_reboot(db_identifier)
+                  print(f"⏸ Instance is in cooldown period ({minutes_since:.1f} minutes since last reboot, need {COOLDOWN_MINUTES}). Skipping reboot.")
+                  return {
+                      'instance': db_identifier,
+                      'type': db_type,
+                      'status': 'cooldown',
+                      'reason': reboot_reason,
+                      'connections': current_connections,
+                      'sessions': current_sessions,
+                      'minutes_since_reboot': minutes_since,
+                      'cooldown_minutes': COOLDOWN_MINUTES,
+                      'action': 'skipped'
+                  }
+              
+              # Reboot the RDS instance
+              reboot_result = reboot_rds_instance(db_identifier)
+              
+              # Record reboot timestamp in DynamoDB
+              record_reboot_timestamp(db_identifier)
+              
+              print(f"🔄 Reboot initiated for {db_identifier}")
+              
+              return {
+                  'instance': db_identifier,
+                  'type': db_type,
+                  'status': 'rebooted',
+                  'reason': reboot_reason,
+                  'connections': current_connections,
+                  'sessions': current_sessions,
+                  'result': reboot_result,
+                  'action': 'rebooted',
+                  'timestamp': datetime.utcnow().isoformat()
+              }
+
+          def get_current_connections(db_identifier):
+              """Get the current number of database connections from CloudWatch"""
+              try:
+                  end_time = datetime.utcnow()
+                  start_time = end_time - timedelta(minutes=5)
+                  
+                  response = cloudwatch.get_metric_statistics(
+                      Namespace='AWS/RDS',
+                      MetricName='DatabaseConnections',
+                      Dimensions=[
+                          {
+                              'Name': 'DBInstanceIdentifier',
+                              'Value': db_identifier
+                          }
+                      ],
+                      StartTime=start_time,
+                      EndTime=end_time,
+                      Period=60,
+                      Statistics=['Average']
+                  )
+                  
+                  if response['Datapoints']:
+                      datapoints = sorted(response['Datapoints'], key=lambda x: x['Timestamp'], reverse=True)
+                      return int(datapoints[0]['Average'])
+                  else:
+                      print(f"⚠ No datapoints found for DatabaseConnections metric for {db_identifier}")
+                      return None
+                      
+              except Exception as e:
+                  print(f"❌ Error getting CloudWatch metrics for {db_identifier}: {str(e)}")
+                  return None
+
+          def get_active_sessions(db_identifier):
+              """Get the current number of active sessions by querying MySQL directly"""
+              try:
+                  import pymysql
+                  
+                  # Get DB credentials from Secrets Manager
+                  secret = get_secret(DB_SECRET_ARN)
+                  
+                  # Get RDS endpoint
+                  rds_response = rds.describe_db_instances(DBInstanceIdentifier=db_identifier)
+                  endpoint = rds_response['DBInstances'][0]['Endpoint']['Address']
+                  port = rds_response['DBInstances'][0]['Endpoint']['Port']
+                  
+                  # Connect to MySQL
+                  connection = pymysql.connect(
+                      host=endpoint,
+                      user=secret['username'],
+                      password=secret['password'],
+                      port=port,
+                      connect_timeout=5
+                  )
+                  
+                  try:
+                      with connection.cursor() as cursor:
+                          cursor.execute("""
+                              SELECT COUNT(*) 
+                              FROM information_schema.PROCESSLIST 
+                              WHERE COMMAND != 'Sleep' 
+                              AND USER != 'system user'
+                              AND ID != CONNECTION_ID()
+                          """)
+                          result = cursor.fetchone()
+                          return result[0] if result else 0
+                  finally:
+                      connection.close()
+                      
+              except Exception as e:
+                  print(f"❌ Error getting active sessions from MySQL for {db_identifier}: {str(e)}")
+                  return None
+
+          def get_secret(secret_arn):
+              """Retrieve database credentials from Secrets Manager"""
+              try:
+                  response = secretsmanager.get_secret_value(SecretId=secret_arn)
+                  return json.loads(response['SecretString'])
+              except Exception as e:
+                  print(f"❌ Error retrieving secret: {str(e)}")
+                  raise
+
+          def is_in_cooldown_period(db_identifier):
+              """Check if the instance was recently rebooted using DynamoDB"""
+              try:
+                  # Check if instance is currently rebooting
+                  response = rds.describe_db_instances(DBInstanceIdentifier=db_identifier)
+                  if not response['DBInstances']:
+                      return False
+                  
+                  db_instance = response['DBInstances'][0]
+                  instance_status = db_instance.get('DBInstanceStatus', '').lower()
+                  
+                  if instance_status in ['rebooting', 'modifying']:
+                      print(f"Instance {db_identifier} is currently {instance_status}")
+                      return True
+                  
+                  # Check DynamoDB for last reboot timestamp
+                  dynamo_response = tracking_table.get_item(Key={'instance_id': db_identifier})
+                  
+                  if 'Item' not in dynamo_response:
+                      print(f"No previous reboot recorded for {db_identifier}")
+                      return False
+                  
+                  last_reboot = dynamo_response['Item'].get('last_reboot_timestamp')
+                  if not last_reboot:
+                      return False
+                  
+                  last_reboot_time = datetime.fromisoformat(last_reboot)
+                  time_since_reboot = datetime.utcnow() - last_reboot_time
+                  minutes_since = time_since_reboot.total_seconds() / 60
+                  
+                  print(f"Last reboot was {minutes_since:.1f} minutes ago")
+                  
+                  return minutes_since < COOLDOWN_MINUTES
+                  
+              except Exception as e:
+                  print(f"❌ Error checking cooldown period for {db_identifier}: {str(e)}")
+                  return False
+
+          def get_minutes_since_last_reboot(db_identifier):
+              """Get minutes since last reboot"""
+              try:
+                  dynamo_response = tracking_table.get_item(Key={'instance_id': db_identifier})
+                  if 'Item' not in dynamo_response:
+                      return 999
+                  
+                  last_reboot = dynamo_response['Item'].get('last_reboot_timestamp')
+                  if not last_reboot:
+                      return 999
+                  
+                  last_reboot_time = datetime.fromisoformat(last_reboot)
+                  time_since_reboot = datetime.utcnow() - last_reboot_time
+                  return time_since_reboot.total_seconds() / 60
+              except:
+                  return 999
+
+          def record_reboot_timestamp(db_identifier):
+              """Record reboot timestamp in DynamoDB"""
+              try:
+                  now = datetime.utcnow()
+                  ttl = int((now + timedelta(days=7)).timestamp())  # Auto-delete after 7 days
+                  
+                  tracking_table.put_item(
+                      Item={
+                          'instance_id': db_identifier,
+                          'last_reboot_timestamp': now.isoformat(),
+                          'ttl': ttl
+                      }
+                  )
+                  print(f"✓ Recorded reboot timestamp for {db_identifier}")
+              except Exception as e:
+                  print(f"⚠ Error recording reboot timestamp: {str(e)}")
+
+          def reboot_rds_instance(db_identifier):
+              """Reboot the RDS instance"""
+              try:
+                  print(f"Initiating reboot for {db_identifier}")
+                  
+                  response = rds.reboot_db_instance(
+                      DBInstanceIdentifier=db_identifier,
+                      ForceFailover=False
+                  )
+                  
+                  print(f"Reboot response: {response['DBInstance']['DBInstanceStatus']}")
+                  
+                  return {
+                      'status': 'success',
+                      'dbInstanceStatus': response['DBInstance']['DBInstanceStatus']
+                  }
+                  
+              except Exception as e:
+                  print(f"❌ Error rebooting RDS instance {db_identifier}: {str(e)}")
+                  return {
+                      'status': 'error',
+                      'error': str(e)
+                  }
+
+  # EventBridge Rule to trigger Lambda periodically
+  MonitoringScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: RDSConnectionMonitorSchedule
+      Description: Trigger RDS auto-reboot Lambda function for both primary and replica
+      ScheduleExpression: !Sub 'rate(${MonitoringFrequency} minutes)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt RDSAutoRebootFunction.Arn
+          Id: RDSAutoRebootTarget
+
+  # Permission for EventBridge to invoke Lambda
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RDSAutoRebootFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt MonitoringScheduleRule.Arn
+
+  # CloudWatch Alarm for primary high connections
+  PrimaryHighConnectionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${PrimaryDBInstanceIdentifier}-HighConnections'
+      AlarmDescription: Alert when primary database connections are high
+      MetricName: DatabaseConnections
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref ConnectionReloadThreshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref PrimaryDBInstanceIdentifier
+
+  # CloudWatch Alarm for replica high connections
+  ReplicaHighConnectionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ReplicaDBInstanceIdentifier}-HighConnections'
+      AlarmDescription: Alert when replica database connections are high
+      MetricName: DatabaseConnections
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref ConnectionReloadThreshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref ReplicaDBInstanceIdentifier
+
+Outputs:
+  LambdaFunctionArn:
+    Description: ARN of the Lambda function
+    Value: !GetAtt RDSAutoRebootFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+  
+  LambdaFunctionName:
+    Description: Name of the Lambda function
+    Value: !Ref RDSAutoRebootFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionName'
+  
+  RebootTrackingTableName:
+    Description: DynamoDB table for tracking reboots
+    Value: !Ref RebootTrackingTable
+    Export:
+      Name: !Sub '${AWS::StackName}-TrackingTable'
+  
+  MonitoringScheduleRuleArn:
+    Description: ARN of the EventBridge rule
+    Value: !GetAtt MonitoringScheduleRule.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ScheduleRuleArn'
+  
+  PrimaryAlarmName:
+    Description: Name of the primary database CloudWatch alarm
+    Value: !Ref PrimaryHighConnectionsAlarm
+    Export:
+      Name: !Sub '${AWS::StackName}-PrimaryAlarmName'
+  
+  ReplicaAlarmName:
+    Description: Name of the replica database CloudWatch alarm
+    Value: !Ref ReplicaHighConnectionsAlarm
+    Export:
+      Name: !Sub '${AWS::StackName}-ReplicaAlarmName'
+  
+  MonitoredInstances:
+    Description: Database instances being monitored
+    Value: !Sub 'Primary: ${PrimaryDBInstanceIdentifier}, Replica: ${ReplicaDBInstanceIdentifier}'
+  
+  ConfigurationSummary:
+    Description: Current monitoring configuration
+    Value: !Sub |
+      Connection Thresholds: Reload=${ConnectionReloadThreshold}, Critical=${ConnectionThreshold}
+      Session Thresholds: Reload=${SessionReloadThreshold}, Critical=${SessionThreshold}
+      Cooldown: ${CooldownMinutes} minutes
+      Check Frequency: ${MonitoringFrequency} minutes
+  
+  DeploymentRegion:
+    Description: Region where stack is deployed
+    Value: !Ref AWS::Region

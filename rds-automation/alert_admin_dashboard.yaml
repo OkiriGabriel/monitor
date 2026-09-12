@@ -1,0 +1,349 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Lambda function to monitor ECS logs for 500, 502, and Bad Gateway errors'
+
+Parameters:
+  ECSLogGroupName:
+    Type: String
+    Description: CloudWatch Log Group name for your ECS service
+    Default: /ecs/your-cluster/your-service
+  
+  SNSTopicArn:
+    Type: String
+    Description: ARN of your existing SNS topic for alerts
+    Default: arn:aws:sns:us-east-1:123456789012:your-topic-name
+  
+  ErrorThreshold:
+    Type: Number
+    Description: Minimum number of errors to trigger alert (within batch)
+    Default: 1
+  
+  AlertCooldownMinutes:
+    Type: Number
+    Description: Minimum minutes between alerts (prevents spam)
+    Default: 5
+
+Resources:
+  # DynamoDB Table for Alert Tracking
+  AlertTrackingTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-alert-tracking'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: alert_key
+          AttributeType: S
+      KeySchema:
+        - AttributeName: alert_key
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+  # IAM Role for Lambda
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SNSPublishPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref SNSTopicArn
+        - PolicyName: DynamoDBPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt AlertTrackingTable.Arn
+
+  # Lambda Function
+  ErrorAlertLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-error-alert'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref SNSTopicArn
+          ERROR_THRESHOLD: !Ref ErrorThreshold
+          ALERT_COOLDOWN_MINUTES: !Ref AlertCooldownMinutes
+          DYNAMODB_TABLE: !Ref AlertTrackingTable
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import gzip
+          import base64
+          import zlib
+          from datetime import datetime, timedelta
+          
+          sns = boto3.client('sns')
+          dynamodb = boto3.client('dynamodb')
+          
+          SNS_TOPIC_ARN = os.environ['SNS_TOPIC_ARN']
+          ERROR_THRESHOLD = int(os.environ.get('ERROR_THRESHOLD', 1))
+          ALERT_COOLDOWN_MINUTES = int(os.environ.get('ALERT_COOLDOWN_MINUTES', 5))
+          DYNAMODB_TABLE = os.environ['DYNAMODB_TABLE']
+          
+          def should_send_alert(log_group):
+              """Check if enough time has passed since last alert"""
+              try:
+                  # Check DynamoDB for last alert time
+                  response = dynamodb.get_item(
+                      TableName=DYNAMODB_TABLE,
+                      Key={'alert_key': {'S': log_group}}
+                  )
+                  
+                  if 'Item' in response:
+                      last_alert_time = int(response['Item']['last_alert']['N'])
+                      current_time = int(datetime.now().timestamp())
+                      cooldown_seconds = ALERT_COOLDOWN_MINUTES * 60
+                      
+                      if (current_time - last_alert_time) < cooldown_seconds:
+                          minutes_left = ((last_alert_time + cooldown_seconds - current_time) / 60)
+                          print(f"Alert suppressed. Cooldown: {minutes_left:.1f} minutes remaining")
+                          return False
+                  
+                  return True
+              except Exception as e:
+                  print(f"Error checking alert cooldown: {e}")
+                  return True  # If check fails, allow alert
+          
+          def record_alert(log_group):
+              """Record that an alert was sent"""
+              try:
+                  current_time = int(datetime.now().timestamp())
+                  ttl = current_time + (ALERT_COOLDOWN_MINUTES * 60 * 2)  # TTL = 2x cooldown
+                  
+                  dynamodb.put_item(
+                      TableName=DYNAMODB_TABLE,
+                      Item={
+                          'alert_key': {'S': log_group},
+                          'last_alert': {'N': str(current_time)},
+                          'ttl': {'N': str(ttl)}
+                      }
+                  )
+                  print(f"Recorded alert timestamp for {log_group}")
+              except Exception as e:
+                  print(f"Error recording alert: {e}")
+          
+          def lambda_handler(event, context):
+              try:
+                  # Print the raw event for debugging
+                  print(f"Received event keys: {event.keys()}")
+                  
+                  # Decode CloudWatch Logs data
+                  compressed_payload = base64.b64decode(event['awslogs']['data'])
+                  
+                  # Try gzip first, then zlib if that fails
+                  try:
+                      uncompressed_payload = gzip.decompress(compressed_payload)
+                  except:
+                      # Sometimes it's zlib compressed instead of gzip
+                      uncompressed_payload = zlib.decompress(compressed_payload, 16+zlib.MAX_WBITS)
+                  
+                  log_data = json.loads(uncompressed_payload)
+                  
+                  print(f"Processing {len(log_data['logEvents'])} log events")
+                  print(f"Log Group: {log_data['logGroup']}")
+                  print(f"Log Stream: {log_data['logStream']}")
+                  
+                  errors = []
+                  error_types = {'500': 0, '502': 0, 'bad_gateway': 0}
+                  
+                  # Parse log events
+                  for log_event in log_data['logEvents']:
+                      message = log_event['message']
+                      timestamp = datetime.fromtimestamp(log_event['timestamp'] / 1000).strftime('%Y-%m-%d %H:%M:%S')
+                      
+                      # Debug: print first 200 chars of each message
+                      print(f"Checking message: {message[:200]}")
+                      
+                      # Check for different error types
+                      is_error = False
+                      error_type = ''
+                      
+                      if ' 500 ' in message:
+                          error_types['500'] += 1
+                          is_error = True
+                          error_type = '500 Internal Server Error'
+                          print(f"✓ Found 500 error!")
+                      elif ' 502 ' in message:
+                          error_types['502'] += 1
+                          is_error = True
+                          error_type = '502 Bad Gateway'
+                          print(f"✓ Found 502 error!")
+                      elif 'bad gateway' in message.lower():
+                          error_types['bad_gateway'] += 1
+                          is_error = True
+                          error_type = 'Bad Gateway'
+                          print(f"✓ Found Bad Gateway error!")
+                      
+                      if is_error:
+                          errors.append({
+                              'timestamp': timestamp,
+                              'message': message[:500],
+                              'type': error_type
+                          })
+                  
+                  print(f"Total errors found: {len(errors)}, Threshold: {ERROR_THRESHOLD}")
+                  
+                  # Send alert if errors exceed threshold AND cooldown period has passed
+                  if len(errors) >= ERROR_THRESHOLD:
+                      # Check if we should send alert (rate limiting)
+                      if not should_send_alert(log_data['logGroup']):
+                          return {
+                              'statusCode': 200,
+                              'body': json.dumps({
+                                  'message': 'Alert suppressed due to cooldown period',
+                                  'errors_found': len(errors),
+                                  'cooldown_minutes': ALERT_COOLDOWN_MINUTES
+                              })
+                          }
+                      
+                      error_count = len(errors)
+                      
+                      # Build error summary
+                      error_summary = '\n\n'.join([
+                          f"[{e['type']}] {e['timestamp']}\n{e['message']}"
+                          for e in errors[:10]  # First 10 errors
+                      ])
+                      
+                      # Build statistics
+                      stats = []
+                      if error_types['500'] > 0:
+                          stats.append(f"500 Errors: {error_types['500']}")
+                      if error_types['502'] > 0:
+                          stats.append(f"502 Errors: {error_types['502']}")
+                      if error_types['bad_gateway'] > 0:
+                          stats.append(f"Bad Gateway: {error_types['bad_gateway']}")
+                      
+                      alert_message = f"""
+          🚨 ECS Error Alert 🚨
+          
+          Total Errors: {error_count}
+          Log Group: {log_data['logGroup']}
+          Log Stream: {log_data['logStream']}
+          
+          Error Breakdown:
+          {chr(10).join(stats)}
+          
+          Recent Error Details:
+          {error_summary}
+          
+          {f'... and {error_count - 10} more errors' if error_count > 10 else ''}
+          
+          ---
+          Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}
+          Next alert will be sent after {ALERT_COOLDOWN_MINUTES} minutes cooldown.
+          """
+                      
+                      sns.publish(
+                          TopicArn=SNS_TOPIC_ARN,
+                          Subject=f'🚨 ECS Alert: {error_count} Errors Detected',
+                          Message=alert_message
+                      )
+                      
+                      # Record that we sent an alert
+                      record_alert(log_data['logGroup'])
+                      
+                      print(f"✓ Alert sent for {error_count} errors")
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps({
+                              'message': f'Alert sent for {error_count} errors',
+                              'errors': error_types
+                          })
+                      }
+                  else:
+                      print(f"Errors found ({len(errors)}) but below threshold ({ERROR_THRESHOLD})")
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps({
+                              'message': f'Errors below threshold',
+                              'errors_found': len(errors),
+                              'threshold': ERROR_THRESHOLD
+                          })
+                      }
+              
+              except Exception as e:
+                  error_msg = f"Error processing logs: {str(e)}"
+                  print(error_msg)
+                  import traceback
+                  print(traceback.format_exc())
+                  
+                  # Send error notification
+                  try:
+                      sns.publish(
+                          TopicArn=SNS_TOPIC_ARN,
+                          Subject='⚠️ ECS Error Alert Lambda Failed',
+                          Message=f'Lambda function failed to process logs:\n\n{str(e)}\n\n{traceback.format_exc()}'
+                      )
+                  except Exception as sns_error:
+                      print(f"Failed to send SNS notification: {sns_error}")
+                  
+                  raise
+
+  # Permission for CloudWatch Logs to invoke Lambda
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ErrorAlertLambda
+      Action: lambda:InvokeFunction
+      Principal: logs.amazonaws.com
+      SourceArn: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${ECSLogGroupName}:*'
+
+  # CloudWatch Logs Subscription Filter
+  LogSubscriptionFilter:
+    Type: AWS::Logs::SubscriptionFilter
+    DependsOn: LambdaInvokePermission
+    Properties:
+      DestinationArn: !GetAtt ErrorAlertLambda.Arn
+      FilterPattern: ''  # Empty = process all logs (Lambda does the filtering)
+      LogGroupName: !Ref ECSLogGroupName
+
+Outputs:
+  LambdaFunctionArn:
+    Description: ARN of the Lambda function
+    Value: !GetAtt ErrorAlertLambda.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-lambda-arn'
+  
+  LambdaFunctionName:
+    Description: Name of the Lambda function
+    Value: !Ref ErrorAlertLambda
+    Export:
+      Name: !Sub '${AWS::StackName}-lambda-name'
+  
+  SubscriptionFilterName:
+    Description: Name of the CloudWatch Logs subscription filter
+    Value: !Ref LogSubscriptionFilter
+    Export:
+      Name: !Sub '${AWS::StackName}-subscription-filter'
+  
+  IAMRoleArn:
+    Description: ARN of the Lambda execution role
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-role-arn'

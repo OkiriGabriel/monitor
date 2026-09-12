@@ -1,0 +1,206 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Certificate expiration alert system - sends alerts 2 weeks before expiration'
+
+Parameters:
+  AlertEmail:
+    Type: String
+    Description: Email address to receive certificate expiration alerts
+    Default: your-email@example.com
+  
+  CertificateExpirationDate:
+    Type: String
+    Description: Certificate expiration date in YYYY-MM-DD format
+    Default: '2025-03-04'
+
+Resources:
+  CertExpirationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: cert-expiration-alerts
+      DisplayName: Certificate Expiration Alerts
+      Subscription:
+        - Endpoint: !Ref AlertEmail
+          Protocol: email
+
+  CertCheckerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cert-checker-lambda-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SNSPublishPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref CertExpirationTopic
+
+  CertExpirationCheckerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: cert-expiration-checker
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt CertCheckerLambdaRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref CertExpirationTopic
+          CERT_EXPIRY_DATE: !Ref CertificateExpirationDate
+          ALERT_DAYS_BEFORE: '14'
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime, timedelta
+          
+          sns = boto3.client('sns')
+          
+          def lambda_handler(event, context):
+              topic_arn = os.environ['SNS_TOPIC_ARN']
+              cert_expiry_str = os.environ['CERT_EXPIRY_DATE']
+              alert_days = int(os.environ['ALERT_DAYS_BEFORE'])
+              
+              cert_expiry_date = datetime.strptime(cert_expiry_str, '%Y-%m-%d')
+              now = datetime.now()
+              days_until_expiry = (cert_expiry_date - now).days
+              
+              print(f"Certificate expires on: {cert_expiry_date.strftime('%B %d, %Y')}")
+              print(f"Days until expiration: {days_until_expiry}")
+              
+              if days_until_expiry <= alert_days and days_until_expiry >= 0:
+                  message = f"""CERTIFICATE EXPIRATION ALERT
+          
+          Your certificate is about to expire!
+          
+          Certificate Expiration Date: {cert_expiry_date.strftime('%B %d, %Y')}
+          Days Remaining: {days_until_expiry}
+          Alert Threshold: {alert_days} days before expiration
+          
+          ACTION REQUIRED: Please renew your certificate as soon as possible.
+          
+          Certificate Details:
+          - Created: December 4, 2024
+          - Valid for: 3 months
+          - Expires: {cert_expiry_date.strftime('%B %d, %Y')}
+          """
+                  
+                  subject = f"ALERT: Certificate Expiring in {days_until_expiry} Days"
+                  
+                  response = sns.publish(
+                      TopicArn=topic_arn,
+                      Message=message,
+                      Subject=subject
+                  )
+                  
+                  print(f"Alert sent successfully. MessageId: {response['MessageId']}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Alert sent successfully',
+                          'daysUntilExpiry': days_until_expiry,
+                          'expirationDate': cert_expiry_str
+                      })
+                  }
+              
+              elif days_until_expiry < 0:
+                  days_overdue = abs(days_until_expiry)
+                  message = f"""CERTIFICATE EXPIRED
+          
+          Your certificate has EXPIRED and is no longer valid!
+          
+          Certificate Expiration Date: {cert_expiry_date.strftime('%B %d, %Y')}
+          Days Since Expiration: {days_overdue}
+          
+          IMMEDIATE ACTION REQUIRED
+          
+          Your services may be experiencing issues due to the expired certificate.
+          Please renew your certificate IMMEDIATELY.
+          
+          Certificate Details:
+          - Created: December 4, 2024
+          - Expired: {cert_expiry_date.strftime('%B %d, %Y')}
+          - Days Overdue: {days_overdue}
+          """
+                  
+                  subject = f"URGENT: Certificate EXPIRED {days_overdue} Days Ago"
+                  
+                  response = sns.publish(
+                      TopicArn=topic_arn,
+                      Message=message,
+                      Subject=subject
+                  )
+                  
+                  print(f"EXPIRED alert sent. MessageId: {response['MessageId']}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'EXPIRED alert sent',
+                          'daysOverdue': days_overdue,
+                          'expirationDate': cert_expiry_str
+                      })
+                  }
+              
+              else:
+                  print(f"No alert needed yet. Certificate expires in {days_until_expiry} days")
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'No alert needed',
+                          'daysUntilExpiry': days_until_expiry,
+                          'alertThreshold': alert_days
+                      })
+                  }
+
+  CertExpirationCheckRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: cert-expiration-daily-check
+      Description: Check certificate expiration daily
+      ScheduleExpression: 'cron(0 9 * * ? *)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt CertExpirationCheckerFunction.Arn
+          Id: CertExpirationCheckerTarget
+
+  CertExpirationCheckPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CertExpirationCheckerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CertExpirationCheckRule.Arn
+
+Outputs:
+  SNSTopicArn:
+    Description: ARN of the SNS topic for certificate expiration alerts
+    Value: !Ref CertExpirationTopic
+    Export:
+      Name: CertExpirationTopicArn
+  
+  LambdaFunctionArn:
+    Description: ARN of the Lambda function checking certificate expiration
+    Value: !GetAtt CertExpirationCheckerFunction.Arn
+    Export:
+      Name: CertExpirationCheckerArn
+  
+  EventBridgeRuleArn:
+    Description: ARN of the EventBridge rule
+    Value: !GetAtt CertExpirationCheckRule.Arn
+  
+  CertificateExpirationDate:
+    Description: The certificate expiration date being monitored
+    Value: !Ref CertificateExpirationDate

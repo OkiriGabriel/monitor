@@ -1,0 +1,83 @@
+Blackbox Exporter Prometheus Queries
+=====================================
+
+Blackbox exporter doesn't expose a _count metric. Use these queries to count requests:
+
+Count TOTAL requests per URL (success + failure) - last hour:
+count_over_time(probe_success{job="blackbox"}[1h])
+
+Count SUCCESSFUL requests per URL - last hour:
+sum_over_time(probe_success{job="blackbox"}[1h])
+
+Count FAILED requests per URL - last hour:
+count_over_time(probe_success{job="blackbox"}[1h]) - sum_over_time(probe_success{job="blackbox"}[1h])
+
+Count total requests across all URLs:
+sum(count_over_time(probe_success{job="blackbox"}[1h]))
+
+Count requests per URL (last 24 hours):
+count_over_time(probe_success{job="blackbox"}[24h])
+
+Request rate (requests per minute):
+count_over_time(probe_success{job="blackbox"}[1m])
+
+List all available blackbox metrics:
+{job="blackbox"}
+
+=====================================
+View ALL Endpoints Separately (Use this in Grafana Table/Graph)
+=====================================
+
+# Shows each endpoint with its total request count (success + failure):
+count_over_time(probe_success{job="blackbox"}[1h])
+
+# Shows each endpoint with successful request count:
+sum_over_time(probe_success{job="blackbox"}[1h])
+
+# Shows each endpoint with failed request count:
+count_over_time(probe_success{job="blackbox"}[1h]) - sum_over_time(probe_success{job="blackbox"}[1h])
+
+# Success rate percentage per endpoint:
+(sum_over_time(probe_success{job="blackbox"}[1h]) / count_over_time(probe_success{job="blackbox"}[1h])) * 100
+
+=====================================
+Filtered Queries by URL Path (Exact Match)
+=====================================
+
+Replace https://api.example.com with your target host.
+
+Base API:
+count_over_time(probe_success{job="blackbox",instance="https://api.example.com"}[1h])
+
+Auth Endpoints:
+count_over_time(probe_success{job="blackbox",instance="https://api.example.com/auth/login"}[1h])
+count_over_time(probe_success{job="blackbox",instance="https://api.example.com/auth/forgot-password"}[1h])
+count_over_time(probe_success{job="blackbox",instance="https://api.example.com/auth/reset-password"}[1h])
+
+Profile Endpoints:
+count_over_time(probe_success{job="blackbox",instance="https://api.example.com/users/profile"}[1h])
+count_over_time(probe_success{job="blackbox",instance="https://api.example.com/users/location"}[1h])
+
+Order Endpoints:
+count_over_time(probe_success{job="blackbox",instance="https://api.example.com/orders/pending"}[1h])
+count_over_time(probe_success{job="blackbox",instance="https://api.example.com/orders/completed"}[1h])
+
+Payment Endpoints:
+count_over_time(probe_success{job="blackbox",instance="https://api.example.com/payments"}[1h])
+count_over_time(probe_success{job="blackbox",instance="https://api.example.com/payments/verify"}[1h])
+
+=====================================
+Grouped by Endpoint Category (Aggregated)
+=====================================
+
+# All auth endpoints:
+sum(count_over_time(probe_success{job="blackbox",instance=~"https://api\\.example\\.com/auth/.*"}[1h]))
+
+# All user endpoints:
+sum(count_over_time(probe_success{job="blackbox",instance=~"https://api\\.example\\.com/users/.*"}[1h]))
+
+# All order endpoints:
+sum(count_over_time(probe_success{job="blackbox",instance=~"https://api\\.example\\.com/orders/.*"}[1h]))
+
+# All payment endpoints:
+sum(count_over_time(probe_success{job="blackbox",instance=~"https://api\\.example\\.com/payments.*"}[1h]))

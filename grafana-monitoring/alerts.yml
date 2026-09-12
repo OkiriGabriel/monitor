@@ -1,0 +1,30 @@
+groups:
+  - name: api_alerts
+    interval: 30s
+    rules:
+      - alert: APIDown
+        expr: probe_success{job="blackbox"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "API is down"
+          description: "{{ $labels.instance }} has been down for more than 2 minutes."
+
+      - alert: APISlowResponse
+        expr: probe_http_duration_seconds{job="blackbox"} > 2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "API slow response time"
+          description: "{{ $labels.instance }} response time is {{ $value }}s (threshold: 2s)."
+
+      - alert: APISSLCertExpiringSoon
+        expr: probe_ssl_earliest_cert_expiry{job="blackbox"} - time() < 86400 * 30
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "SSL certificate expiring soon"
+          description: "{{ $labels.instance }} SSL certificate expires in less than 30 days."
